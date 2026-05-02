@@ -15,19 +15,21 @@ Shortcuts       Ctrl+S save, Ctrl+O open, Escape/Ctrl+Z reset crop
 ## Setup
 
 ### Create virtual enviroment
+
 python -m venv .venv
 
 ### Installation
-pip install PyQt5 Pillow pillow-heif PyQt5-stubs
 
+pip install PyQt5 Pillow pillow-heif PyQt5-stubs
 
 ## Usage
 
 ### Activate virtual enviroment
+
 .\.venv\Scripts\activate
 
+deactivate
+
 ### Run
+
 python photo_editor.py
-
-
-

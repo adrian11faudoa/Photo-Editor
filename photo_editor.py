@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PhotoCrop Pro - A modern desktop photo editor with crop functionality.
+PhotoCrop Studio - A modern desktop photo editor with crop functionality.
 Requires: pip install Pillow PyQt5
 Optional HEIC support: pip install pillow-heif
 """
@@ -419,7 +419,7 @@ class CropCanvas(QWidget):
 class PhotoEditorWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PhotoCrop Pro")
+        self.setWindowTitle("Image Crop Studio")
         self.resize(1200, 800)
         self.setMinimumSize(900, 600)
 
