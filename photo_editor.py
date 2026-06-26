@@ -19,7 +19,7 @@ try:
         QComboBox
     )
     from PyQt5.QtCore import (
-        Qt, QRect, QPoint, QSize, QThread, pyqtSignal, QTimer, QRectF
+        Qt, QRect, QPoint, QPointF, QSize, QThread, pyqtSignal, QTimer, QRectF
     )
     from PyQt5.QtGui import (
         QPixmap, QPainter, QColor, QPen, QBrush, QFont, QKeySequence,
@@ -36,7 +36,7 @@ except ImportError:
         QComboBox
     )
     from PyQt5.QtCore import (
-        Qt, QRect, QPoint, QSize, QThread, pyqtSignal, QTimer, QRectF
+        Qt, QRect, QPoint, QPointF, QSize, QThread, pyqtSignal, QTimer, QRectF
     )
     from PyQt5.QtGui import (
         QPixmap, QPainter, QColor, QPen, QBrush, QFont, QKeySequence,
@@ -74,44 +74,48 @@ DANGER       = "#ff5555"
 SUCCESS      = "#50fa7b"
 OVERLAY_CLR  = QColor(0, 0, 0, 140)
 
-HANDLE_SIZE = 10
-EDGE_TOLERANCE = 12
+HANDLE_SIZE = 12
+HANDLE_HIT_SIZE = 18
+MIN_CROP_SIZE = 20
 
 # ─── Crop Canvas Widget ────────────────────────────────────────────────────────
 class CropCanvas(QWidget):
     crop_changed = pyqtSignal(QRect)
+    zoom_changed = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMouseTracking(True)
+        self.setAttribute(Qt.WA_OpaquePaintEvent, True)
         self.setCursor(Qt.CrossCursor)
 
         self._pixmap: Optional[QPixmap] = None
         self._img_rect = QRect()       # where image is rendered on canvas
-        self._crop_rect = QRect()      # crop rect in canvas coords
-        self._scale = 1.0
-        self._offset = QPoint(0, 0)
+        self._crop_rect = QRectF()     # crop rect in original image coords
+        self._base_scale = 1.0
 
         # Interaction state
         self._drag_mode = None         # None | 'create' | 'move' | 'resize'
         self._drag_start = QPoint()
-        self._drag_crop_start = QRect()
+        self._drag_start_img = QPointF()
+        self._drag_crop_start = QRectF()
         self._resize_handle = None     # 'tl','tc','tr','ml','mr','bl','bc','br'
 
         self._aspect_ratio: Optional[float] = None  # None = free
         self._pan_start = QPoint()
-        self._pan_offset = QPoint(0, 0)
+        self._pan_offset = QPointF(0, 0)
         self._panning = False
         self._zoom = 1.0
-        self._zoom_center = QPoint()
 
     # ── Public API ────────────────────────────────────────────────────────────
     def set_image(self, pixmap: QPixmap):
         self._pixmap = pixmap
         self._zoom = 1.0
-        self._pan_offset = QPoint(0, 0)
-        self._crop_rect = QRect()
+        self._pan_offset = QPointF(0, 0)
         self._fit_image()
+        self._reset_crop_to_full_image()
+        self.zoom_changed.emit(self.zoom_percent())
+        self._emit_crop_changed()
         self.update()
 
     def set_aspect_ratio(self, ratio: Optional[float]):
@@ -119,27 +123,39 @@ class CropCanvas(QWidget):
         self.update()
 
     def reset_crop(self):
-        self._crop_rect = QRect()
+        self._reset_crop_to_full_image()
+        self._emit_crop_changed()
         self.update()
+
+    def zoom_percent(self) -> int:
+        return int(round(self._zoom * 100))
+
+    def set_zoom_percent(self, percent: int):
+        center = QPoint(self.width() // 2, self.height() // 2)
+        self._set_zoom(percent / 100, center)
+
+    def step_zoom(self, direction: int):
+        factor = 1.15 if direction > 0 else 1 / 1.15
+        center = QPoint(self.width() // 2, self.height() // 2)
+        self._set_zoom(self._zoom * factor, center)
 
     def get_crop_in_image_coords(self) -> Optional[QRect]:
         """Return crop rect in original image pixel coordinates."""
         if self._crop_rect.isNull() or not self._pixmap:
             return None
-        ir = self._img_rect
-        if ir.width() == 0 or ir.height() == 0:
-            return None
-        sx = self._pixmap.width() / ir.width()
-        sy = self._pixmap.height() / ir.height()
-        cr = self._crop_rect.intersected(ir)
-        x = int((cr.left() - ir.left()) * sx)
-        y = int((cr.top() - ir.top()) * sy)
-        w = int(cr.width() * sx)
-        h = int(cr.height() * sy)
-        return QRect(x, y, max(1, w), max(1, h))
+        r = self._crop_rect.normalized().intersected(self._image_bounds())
+        x = max(0, int(round(r.left())))
+        y = max(0, int(round(r.top())))
+        right = min(self._pixmap.width(), int(round(r.right())))
+        bottom = min(self._pixmap.height(), int(round(r.bottom())))
+        return QRect(x, y, max(1, right - x), max(1, bottom - y))
 
     def has_crop(self) -> bool:
-        return not self._crop_rect.isNull() and self._crop_rect.width() > 4
+        return (
+            not self._crop_rect.isNull()
+            and self._crop_rect.width() >= 1
+            and self._crop_rect.height() >= 1
+        )
 
     # ── Layout ────────────────────────────────────────────────────────────────
     def _fit_image(self):
@@ -150,22 +166,53 @@ class CropCanvas(QWidget):
         if cw <= 0 or ch <= 0:
             return
         scale = min(cw / pw, ch / ph) * 0.9
-        self._scale = scale
-        iw, ih = int(pw * scale), int(ph * scale)
-        x = (cw - iw) // 2
-        y = (ch - ih) // 2
-        self._img_rect = QRect(x, y, iw, ih)
+        self._base_scale = max(0.01, scale)
+        self._update_image_rect()
 
     def resizeEvent(self, event):
         self._fit_image()
         self.update()
 
+    def _update_image_rect(self):
+        if not self._pixmap:
+            self._img_rect = QRect()
+            return
+
+        scale = self._base_scale * self._zoom
+        iw = max(1, int(round(self._pixmap.width() * scale)))
+        ih = max(1, int(round(self._pixmap.height() * scale)))
+        self._limit_pan(iw, ih)
+        x = int(round((self.width() - iw) / 2 + self._pan_offset.x()))
+        y = int(round((self.height() - ih) / 2 + self._pan_offset.y()))
+        self._img_rect = QRect(x, y, iw, ih)
+
+    def _limit_pan(self, iw: Optional[int] = None, ih: Optional[int] = None):
+        if not self._pixmap:
+            return
+        if iw is None or ih is None:
+            scale = self._base_scale * self._zoom
+            iw = max(1, int(round(self._pixmap.width() * scale)))
+            ih = max(1, int(round(self._pixmap.height() * scale)))
+
+        def clamp_axis(view_size: int, image_size: int, current: float) -> float:
+            if image_size <= view_size:
+                return 0.0
+            centered_left = (view_size - image_size) / 2
+            min_offset = view_size - image_size - centered_left
+            max_offset = -centered_left
+            return min(max(current, min_offset), max_offset)
+
+        self._pan_offset = QPointF(
+            clamp_axis(self.width(), iw, self._pan_offset.x()),
+            clamp_axis(self.height(), ih, self._pan_offset.y())
+        )
+
     # ── Paint ─────────────────────────────────────────────────────────────────
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
 
-        # Background
         painter.fillRect(self.rect(), QColor(BG_DARK))
 
         if not self._pixmap:
@@ -174,173 +221,81 @@ class CropCanvas(QWidget):
             painter.drawText(self.rect(), Qt.AlignCenter, "Open a folder to begin")
             return
 
-        # Draw image
         painter.drawPixmap(self._img_rect, self._pixmap)
 
-        # Draw overlay + crop
         if not self._crop_rect.isNull() and self._crop_rect.width() > 2:
-            cr = self._crop_rect.intersected(self._img_rect)
+            cr = self._crop_screen_rect()
+            ir = QRectF(self._img_rect)
 
-            # Dark overlay (4 rects around crop)
-            painter.fillRect(
-                self._img_rect.left(), self._img_rect.top(),
-                self._img_rect.width(), cr.top() - self._img_rect.top(),
-                OVERLAY_CLR)
-            painter.fillRect(
-                self._img_rect.left(), cr.bottom(),
-                self._img_rect.width(), self._img_rect.bottom() - cr.bottom(),
-                OVERLAY_CLR)
-            painter.fillRect(
-                self._img_rect.left(), cr.top(),
-                cr.left() - self._img_rect.left(), cr.height(),
-                OVERLAY_CLR)
-            painter.fillRect(
-                cr.right(), cr.top(),
-                self._img_rect.right() - cr.right(), cr.height(),
-                OVERLAY_CLR)
+            painter.fillRect(QRectF(ir.left(), ir.top(), ir.width(), cr.top() - ir.top()), OVERLAY_CLR)
+            painter.fillRect(QRectF(ir.left(), cr.bottom(), ir.width(), ir.bottom() - cr.bottom()), OVERLAY_CLR)
+            painter.fillRect(QRectF(ir.left(), cr.top(), cr.left() - ir.left(), cr.height()), OVERLAY_CLR)
+            painter.fillRect(QRectF(cr.right(), cr.top(), ir.right() - cr.right(), cr.height()), OVERLAY_CLR)
 
-            # Crop border
-            pen = QPen(QColor(ACCENT_BLUE), 1.5)
-            painter.setPen(pen)
+            painter.setPen(QPen(QColor(255, 255, 255), 1.25))
             painter.setBrush(Qt.NoBrush)
             painter.drawRect(cr)
 
-            # Rule-of-thirds grid lines
-            pen2 = QPen(QColor(255, 255, 255, 50), 0.7, Qt.DashLine)
-            painter.setPen(pen2)
+            painter.setPen(QPen(QColor(255, 255, 255, 110), 0.8, Qt.SolidLine))
             for i in (1, 2):
-                x = cr.left() + cr.width() * i // 3
-                painter.drawLine(x, cr.top(), x, cr.bottom())
-                y = cr.top() + cr.height() * i // 3
-                painter.drawLine(cr.left(), y, cr.right(), y)
+                x = cr.left() + cr.width() * i / 3
+                painter.drawLine(QPointF(x, cr.top()), QPointF(x, cr.bottom()))
+                y = cr.top() + cr.height() * i / 3
+                painter.drawLine(QPointF(cr.left(), y), QPointF(cr.right(), y))
 
-            # Corner & edge handles
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(ACCENT_BLUE))
-            for hx, hy in self._handle_positions(cr):
-                painter.drawRect(hx - HANDLE_SIZE//2, hy - HANDLE_SIZE//2, HANDLE_SIZE, HANDLE_SIZE)
+            for _, point in self._handle_positions(cr):
+                handle_rect = QRectF(
+                    point.x() - HANDLE_SIZE / 2,
+                    point.y() - HANDLE_SIZE / 2,
+                    HANDLE_SIZE,
+                    HANDLE_SIZE
+                )
+                painter.setPen(QPen(QColor(0, 0, 0, 180), 1))
+                painter.setBrush(QColor(255, 255, 255))
+                painter.drawRoundedRect(handle_rect, 2, 2)
 
         elif self._drag_mode == 'create' and not self._crop_rect.isNull():
-            pen = QPen(QColor(ACCENT_BLUE), 1.5, Qt.DashLine)
-            painter.setPen(pen)
+            painter.setPen(QPen(QColor(255, 255, 255), 1.25, Qt.DashLine))
             painter.setBrush(Qt.NoBrush)
-            painter.drawRect(self._crop_rect)
+            painter.drawRect(self._crop_screen_rect())
 
         painter.end()
 
-    def _handle_positions(self, r: QRect) -> List[Tuple[int, int]]:
+    def _handle_positions(self, r: QRectF) -> List[Tuple[str, QPointF]]:
         cx, cy = r.center().x(), r.center().y()
         return [
-            (r.left(), r.top()), (cx, r.top()), (r.right(), r.top()),
-            (r.left(), cy),                      (r.right(), cy),
-            (r.left(), r.bottom()), (cx, r.bottom()), (r.right(), r.bottom()),
+            ('tl', QPointF(r.left(), r.top())),
+            ('tc', QPointF(cx, r.top())),
+            ('tr', QPointF(r.right(), r.top())),
+            ('ml', QPointF(r.left(), cy)),
+            ('mr', QPointF(r.right(), cy)),
+            ('bl', QPointF(r.left(), r.bottom())),
+            ('bc', QPointF(cx, r.bottom())),
+            ('br', QPointF(r.right(), r.bottom())),
         ]
 
-    def _handle_names(self):
-        return ['tl', 'tc', 'tr', 'ml', 'mr', 'bl', 'bc', 'br']
-
-    def _hit_handle(self, pos: QPoint, r: QRect) -> Optional[str]:
-        positions = self._handle_positions(r)
-        names = self._handle_names()
-        for (hx, hy), name in zip(positions, names):
-            if abs(pos.x() - hx) <= EDGE_TOLERANCE and abs(pos.y() - hy) <= EDGE_TOLERANCE:
+    def _hit_handle(self, pos: QPoint, r: QRectF) -> Optional[str]:
+        for name, point in self._handle_positions(r):
+            if (
+                abs(pos.x() - point.x()) <= HANDLE_HIT_SIZE / 2
+                and abs(pos.y() - point.y()) <= HANDLE_HIT_SIZE / 2
+            ):
                 return name
         return None
 
-    def _cursor_for_handle(self, handle: str) -> Qt.CursorShape:
-        return {
-            'tl': Qt.SizeFDiagCursor, 'br': Qt.SizeFDiagCursor,
-            'tr': Qt.SizeBDiagCursor, 'bl': Qt.SizeBDiagCursor,
-            'tc': Qt.SizeVerCursor,   'bc': Qt.SizeVerCursor,
-            'ml': Qt.SizeHorCursor,   'mr': Qt.SizeHorCursor,
-        }.get(handle, Qt.SizeAllCursor)
+    def _cursor_for_handle(self, handle: str):
+        if handle in ('ml', 'mr'):
+            return Qt.SizeHorCursor
+        if handle in ('tc', 'bc'):
+            return Qt.SizeVerCursor
+        if handle in ('tl', 'br'):
+            return Qt.SizeFDiagCursor
+        if handle in ('tr', 'bl'):
+            return Qt.SizeBDiagCursor
+        return Qt.ArrowCursor
 
-    # ── Mouse Events ──────────────────────────────────────────────────────────
-    def mousePressEvent(self, event):
-        pos = event.pos()
-
-        # Middle-click or Space+drag = pan (handled via keyboard flag)
-        if event.button() == Qt.MiddleButton:
-            self._panning = True
-            self._pan_start = pos
-            self.setCursor(Qt.ClosedHandCursor)
-            return
-
-        if event.button() == Qt.LeftButton:
-            cr = self._crop_rect.intersected(self._img_rect) if not self._crop_rect.isNull() else QRect()
-
-            handle = self._hit_handle(pos, cr) if not cr.isNull() else None
-            if handle:
-                self._drag_mode = 'resize'
-                self._resize_handle = handle
-                self._drag_start = pos
-                self._drag_crop_start = QRect(cr)
-                return
-
-            if not cr.isNull() and cr.contains(pos):
-                self._drag_mode = 'move'
-                self._drag_start = pos
-                self._drag_crop_start = QRect(self._crop_rect)
-                self.setCursor(Qt.ClosedHandCursor)
-                return
-
-            if self._img_rect.contains(pos):
-                self._drag_mode = 'create'
-                self._drag_start = pos
-                self._crop_rect = QRect(pos, pos)
-
-    def mouseMoveEvent(self, event):
-        pos = event.pos()
-
-        if self._panning:
-            delta = pos - self._pan_start
-            self._pan_start = pos
-            self._img_rect.translate(delta)
-            self.update()
-            return
-
-        if self._drag_mode == 'create':
-            p1, p2 = self._drag_start, pos
-            r = QRect(p1, p2).normalized().intersected(self._img_rect)
-            if self._aspect_ratio:
-                w = r.width()
-                h = int(w / self._aspect_ratio)
-                if p2.y() < p1.y():
-                    r.setTop(r.bottom() - h)
-                else:
-                    r.setBottom(r.top() + h)
-            self._crop_rect = r
-            self.update()
-            return
-
-        if self._drag_mode == 'move':
-            delta = pos - self._drag_start
-            new_rect = QRect(
-                self._drag_crop_start.left() + delta.x(),
-                self._drag_crop_start.top() + delta.y(),
-                self._drag_crop_start.width(),
-                self._drag_crop_start.height()
-            )
-            # Clamp to image
-            if new_rect.left() < self._img_rect.left():
-                new_rect.moveLeft(self._img_rect.left())
-            if new_rect.top() < self._img_rect.top():
-                new_rect.moveTop(self._img_rect.top())
-            if new_rect.right() > self._img_rect.right():
-                new_rect.moveRight(self._img_rect.right())
-            if new_rect.bottom() > self._img_rect.bottom():
-                new_rect.moveBottom(self._img_rect.bottom())
-            self._crop_rect = new_rect
-            self.update()
-            return
-
-        if self._drag_mode == 'resize':
-            self._resize_crop(pos)
-            self.update()
-            return
-
-        # Hover cursor
-        cr = self._crop_rect.intersected(self._img_rect) if not self._crop_rect.isNull() else QRect()
+    def _update_hover_cursor(self, pos: QPoint):
+        cr = self._crop_screen_rect() if not self._crop_rect.isNull() else QRectF()
         if not cr.isNull():
             handle = self._hit_handle(pos, cr)
             if handle:
@@ -349,70 +304,285 @@ class CropCanvas(QWidget):
             if cr.contains(pos):
                 self.setCursor(Qt.SizeAllCursor)
                 return
-        self.setCursor(Qt.CrossCursor)
+        self.setCursor(Qt.OpenHandCursor if self._is_pannable() and self.has_crop() else Qt.CrossCursor)
+
+    def mousePressEvent(self, event):
+        if not self._pixmap:
+            return
+        pos = event.pos()
+
+        if event.button() == Qt.MiddleButton:
+            self._start_pan(pos)
+            return
+
+        if event.button() == Qt.LeftButton:
+            cr = self._crop_screen_rect() if not self._crop_rect.isNull() else QRectF()
+
+            handle = self._hit_handle(pos, cr) if not cr.isNull() else None
+            if handle:
+                self._drag_mode = 'resize'
+                self._resize_handle = handle
+                self._drag_start = pos
+                self._drag_crop_start = QRectF(self._crop_rect)
+                self.setCursor(self._cursor_for_handle(handle))
+                return
+
+            if not cr.isNull() and cr.contains(pos) and not self._crop_covers_image():
+                self._drag_mode = 'move'
+                self._drag_start = pos
+                self._drag_start_img = self._screen_to_image(pos)
+                self._drag_crop_start = QRectF(self._crop_rect)
+                self.setCursor(Qt.ClosedHandCursor)
+                return
+
+            if self._img_rect.contains(pos):
+                self._drag_mode = 'create'
+                self._drag_start = pos
+                self._drag_start_img = self._screen_to_image(pos)
+                self._crop_rect = QRectF(self._drag_start_img, self._drag_start_img)
+                self._emit_crop_changed()
+                self.update()
+                return
+
+            if self._is_pannable() and self.has_crop():
+                self._start_pan(pos)
+
+    def mouseMoveEvent(self, event):
+        if not self._pixmap:
+            return
+        pos = event.pos()
+
+        if self._panning:
+            delta = pos - self._pan_start
+            self._pan_start = pos
+            self._pan_offset += QPointF(delta)
+            self._update_image_rect()
+            self.update()
+            return
+
+        if self._drag_mode == 'create':
+            self._crop_rect = self._make_crop_rect(self._drag_start_img, self._screen_to_image(pos))
+            self._emit_crop_changed()
+            self.update()
+            return
+
+        if self._drag_mode == 'move':
+            delta = self._screen_to_image(pos) - self._drag_start_img
+            new_rect = QRectF(self._drag_crop_start)
+            new_rect.translate(delta)
+            self._crop_rect = self._clamp_crop_rect(new_rect)
+            self._emit_crop_changed()
+            self.update()
+            return
+
+        if self._drag_mode == 'resize':
+            self._resize_crop(self._screen_to_image(pos))
+            self._emit_crop_changed()
+            self.update()
+            return
+
+        self._update_hover_cursor(pos)
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MiddleButton:
-            self._panning = False
-            self.setCursor(Qt.CrossCursor)
+            self._stop_pan()
             return
         if event.button() == Qt.LeftButton:
-            if self._drag_mode == 'create' and self._crop_rect.width() < 5:
-                self._crop_rect = QRect()
+            if self._panning:
+                self._stop_pan()
+                return
+            if self._drag_mode == 'create' and (
+                self._crop_rect.width() < self._min_crop_width()
+                or self._crop_rect.height() < self._min_crop_height()
+            ):
+                self._reset_crop_to_full_image()
             self._drag_mode = None
-            self.setCursor(Qt.CrossCursor)
-            self.crop_changed.emit(self._crop_rect)
+            self._resize_handle = None
+            self._update_hover_cursor(event.pos())
+            self._emit_crop_changed()
             self.update()
 
     def wheelEvent(self, event):
         if not self._pixmap:
             return
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
-        center = event.pos()
-        # Scale img_rect around cursor
-        old = self._img_rect
-        nw = int(old.width() * factor)
-        nh = int(old.height() * factor)
-        nx = center.x() - int((center.x() - old.left()) * factor)
-        ny = center.y() - int((center.y() - old.top()) * factor)
-        self._img_rect = QRect(nx, ny, nw, nh)
-        # Scale crop rect proportionally
-        if not self._crop_rect.isNull():
-            fw = nw / old.width() if old.width() else 1
-            fh = nh / old.height() if old.height() else 1
-            cx = nx + int((self._crop_rect.left() - old.left()) * fw)
-            cy = ny + int((self._crop_rect.top() - old.top()) * fh)
-            cw = int(self._crop_rect.width() * fw)
-            ch = int(self._crop_rect.height() * fh)
-            self._crop_rect = QRect(cx, cy, cw, ch)
+        self._set_zoom(self._zoom * factor, event.pos())
+        event.accept()
+
+    def _start_pan(self, pos: QPoint):
+        if not self._is_pannable():
+            return
+        self._panning = True
+        self._pan_start = pos
+        self.setCursor(Qt.ClosedHandCursor)
+
+    def _stop_pan(self):
+        self._panning = False
+        self._update_hover_cursor(self.mapFromGlobal(QCursor.pos()))
+
+    def _set_zoom(self, zoom: float, anchor: QPoint):
+        if not self._pixmap or self._img_rect.isNull():
+            return
+        new_zoom = max(0.5, min(4.0, zoom))
+        if abs(new_zoom - self._zoom) < 0.001:
+            return
+
+        old = QRectF(self._img_rect)
+        rel_x = 0.5 if old.width() == 0 else (anchor.x() - old.left()) / old.width()
+        rel_y = 0.5 if old.height() == 0 else (anchor.y() - old.top()) / old.height()
+        self._zoom = new_zoom
+
+        scale = self._base_scale * self._zoom
+        new_w = max(1, self._pixmap.width() * scale)
+        new_h = max(1, self._pixmap.height() * scale)
+        target_left = anchor.x() - rel_x * new_w
+        target_top = anchor.y() - rel_y * new_h
+        self._pan_offset = QPointF(
+            target_left - (self.width() - new_w) / 2,
+            target_top - (self.height() - new_h) / 2
+        )
+        self._update_image_rect()
+        self.zoom_changed.emit(self.zoom_percent())
         self.update()
 
-    def _resize_crop(self, pos: QPoint):
-        r = QRect(self._drag_crop_start)
-        h = self._resize_handle
-        ir = self._img_rect
+    def _resize_crop(self, pos: QPointF):
+        r = QRectF(self._drag_crop_start)
+        h = self._resize_handle or ''
+        bounds = self._image_bounds()
+        min_w = self._min_crop_width()
+        min_h = self._min_crop_height()
 
         if 'l' in h:
-            r.setLeft(max(ir.left(), min(pos.x(), r.right() - 4)))
+            r.setLeft(max(bounds.left(), min(pos.x(), r.right() - min_w)))
         if 'r' in h:
-            r.setRight(min(ir.right(), max(pos.x(), r.left() + 4)))
+            r.setRight(min(bounds.right(), max(pos.x(), r.left() + min_w)))
         if 't' in h:
-            r.setTop(max(ir.top(), min(pos.y(), r.bottom() - 4)))
+            r.setTop(max(bounds.top(), min(pos.y(), r.bottom() - min_h)))
         if 'b' in h:
-            r.setBottom(min(ir.bottom(), max(pos.y(), r.top() + 4)))
-        if 'c' in h:
-            if h == 'tc' or h == 'bc':
-                pass  # already handled t/b
-            elif h == 'ml' or h == 'mr':
-                pass
+            r.setBottom(min(bounds.bottom(), max(pos.y(), r.top() + min_h)))
 
-        if self._aspect_ratio and r.height() > 0:
-            if 'l' in h or 'r' in h:
-                r.setHeight(int(r.width() / self._aspect_ratio))
+        if self._aspect_ratio and h in ('tl', 'tr', 'bl', 'br') and r.height() > 0:
+            ratio = self._aspect_ratio
+            if r.width() / r.height() > ratio:
+                target_w = r.height() * ratio
+                if 'l' in h:
+                    r.setLeft(r.right() - target_w)
+                else:
+                    r.setRight(r.left() + target_w)
             else:
-                r.setWidth(int(r.height() * self._aspect_ratio))
+                target_h = r.width() / ratio
+                if 't' in h:
+                    r.setTop(r.bottom() - target_h)
+                else:
+                    r.setBottom(r.top() + target_h)
 
-        self._crop_rect = r
+        self._crop_rect = self._clamp_crop_rect(r)
+
+    def _emit_crop_changed(self):
+        self.crop_changed.emit(self.get_crop_in_image_coords() or QRect())
+
+    def _reset_crop_to_full_image(self):
+        self._crop_rect = self._image_bounds() if self._pixmap else QRectF()
+
+    def _crop_covers_image(self) -> bool:
+        if not self._pixmap or self._crop_rect.isNull():
+            return False
+        return self._crop_rect.normalized() == self._image_bounds()
+
+    def _crop_screen_rect(self) -> QRectF:
+        if self._crop_rect.isNull() or not self._pixmap or self._img_rect.isNull():
+            return QRectF()
+        return QRectF(
+            self._img_rect.left() + self._crop_rect.left() / self._pixmap.width() * self._img_rect.width(),
+            self._img_rect.top() + self._crop_rect.top() / self._pixmap.height() * self._img_rect.height(),
+            self._crop_rect.width() / self._pixmap.width() * self._img_rect.width(),
+            self._crop_rect.height() / self._pixmap.height() * self._img_rect.height()
+        )
+
+    def _screen_to_image(self, pos: QPoint) -> QPointF:
+        if not self._pixmap or self._img_rect.isNull():
+            return QPointF()
+        x = (pos.x() - self._img_rect.left()) / self._img_rect.width() * self._pixmap.width()
+        y = (pos.y() - self._img_rect.top()) / self._img_rect.height() * self._pixmap.height()
+        return QPointF(
+            max(0.0, min(float(self._pixmap.width()), x)),
+            max(0.0, min(float(self._pixmap.height()), y))
+        )
+
+    def _image_bounds(self) -> QRectF:
+        if not self._pixmap:
+            return QRectF()
+        return QRectF(0, 0, self._pixmap.width(), self._pixmap.height())
+
+    def _min_crop_width(self) -> float:
+        return min(float(MIN_CROP_SIZE), float(self._pixmap.width())) if self._pixmap else MIN_CROP_SIZE
+
+    def _min_crop_height(self) -> float:
+        return min(float(MIN_CROP_SIZE), float(self._pixmap.height())) if self._pixmap else MIN_CROP_SIZE
+
+    def _make_crop_rect(self, start: QPointF, current: QPointF) -> QRectF:
+        bounds = self._image_bounds()
+        min_w = self._min_crop_width()
+        min_h = self._min_crop_height()
+
+        if self._aspect_ratio:
+            dx = current.x() - start.x()
+            dy = current.y() - start.y()
+            if dx == 0 or dy == 0:
+                return QRectF(start, current).normalized()
+            sx = 1 if dx >= 0 else -1
+            sy = 1 if dy >= 0 else -1
+            max_w = bounds.right() - start.x() if sx > 0 else start.x() - bounds.left()
+            max_h = bounds.bottom() - start.y() if sy > 0 else start.y() - bounds.top()
+            width = min(abs(dx), max_w)
+            height = width / self._aspect_ratio
+            if height > min(abs(dy), max_h):
+                height = min(abs(dy), max_h)
+                width = height * self._aspect_ratio
+            width = min(max(width, min_w), max_w)
+            height = min(max(height, min_h), max_h)
+            if height * self._aspect_ratio <= max_w:
+                width = height * self._aspect_ratio
+            elif width / self._aspect_ratio <= max_h:
+                height = width / self._aspect_ratio
+            end = QPointF(start.x() + sx * width, start.y() + sy * height)
+            return QRectF(start, end).normalized().intersected(bounds)
+
+        r = QRectF(start, current).normalized().intersected(bounds)
+        if r.width() > 0 and r.width() < min_w:
+            if current.x() >= start.x():
+                r.setRight(min(bounds.right(), r.left() + min_w))
+            else:
+                r.setLeft(max(bounds.left(), r.right() - min_w))
+        if r.height() > 0 and r.height() < min_h:
+            if current.y() >= start.y():
+                r.setBottom(min(bounds.bottom(), r.top() + min_h))
+            else:
+                r.setTop(max(bounds.top(), r.bottom() - min_h))
+        return r
+
+    def _clamp_crop_rect(self, rect: QRectF) -> QRectF:
+        bounds = self._image_bounds()
+        r = QRectF(rect).normalized()
+        if r.width() > bounds.width():
+            r.setWidth(bounds.width())
+        if r.height() > bounds.height():
+            r.setHeight(bounds.height())
+        if r.left() < bounds.left():
+            r.moveLeft(bounds.left())
+        if r.top() < bounds.top():
+            r.moveTop(bounds.top())
+        if r.right() > bounds.right():
+            r.moveRight(bounds.right())
+        if r.bottom() > bounds.bottom():
+            r.moveBottom(bounds.bottom())
+        return r.intersected(bounds)
+
+    def _is_pannable(self) -> bool:
+        return (
+            self._pixmap is not None
+            and (self._img_rect.width() > self.width() or self._img_rect.height() > self.height())
+        )
 
 
 # ─── Main Window ──────────────────────────────────────────────────────────────
@@ -528,6 +698,41 @@ class PhotoEditorWindow(QMainWindow):
             QFrame#bottombar {{
                 background: {BG_PANEL};
                 border-top: 1px solid {BORDER};
+            }}
+            QToolButton#zoomButton {{
+                background: {BG_CARD};
+                color: {TEXT_PRIMARY};
+                border: 1px solid {BORDER};
+                border-radius: 5px;
+                min-width: 26px;
+                min-height: 24px;
+                font-size: 15px;
+            }}
+            QToolButton#zoomButton:hover {{
+                background: {BG_HOVER};
+                border-color: {ACCENT_BLUE};
+            }}
+            QLabel#zoomlabel {{
+                color: {TEXT_MUTED};
+                font-size: 12px;
+                min-width: 42px;
+            }}
+            QSlider::groove:horizontal {{
+                height: 4px;
+                background: {BORDER};
+                border-radius: 2px;
+            }}
+            QSlider::handle:horizontal {{
+                width: 14px;
+                height: 14px;
+                margin: -5px 0;
+                border-radius: 7px;
+                background: {TEXT_PRIMARY};
+                border: 1px solid {BG_DARK};
+            }}
+            QSlider::sub-page:horizontal {{
+                background: {ACCENT_BLUE};
+                border-radius: 2px;
             }}
             QStatusBar {{
                 background: {BG_PANEL};
@@ -683,6 +888,7 @@ class PhotoEditorWindow(QMainWindow):
     def _build_canvas_area(self):
         self._canvas = CropCanvas()
         self._canvas.crop_changed.connect(self._on_crop_changed)
+        self._canvas.zoom_changed.connect(self._on_canvas_zoom_changed)
         return self._canvas
 
     def _build_bottombar(self):
@@ -726,8 +932,47 @@ class PhotoEditorWindow(QMainWindow):
         layout.addWidget(self._lbl_counter)
         layout.addSpacing(20)
         layout.addWidget(self._lbl_crop_info)
+        layout.addSpacing(16)
+        layout.addWidget(self._build_zoom_controls())
 
         return bar
+
+    def _build_zoom_controls(self):
+        wrap = QWidget()
+        layout = QHBoxLayout(wrap)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        self._btn_zoom_out = QToolButton()
+        self._btn_zoom_out.setObjectName("zoomButton")
+        self._btn_zoom_out.setText("-")
+        self._btn_zoom_out.setToolTip("Zoom out")
+        self._btn_zoom_out.clicked.connect(lambda: self._canvas.step_zoom(-1))
+
+        self._zoom_slider = QSlider(Qt.Horizontal)
+        self._zoom_slider.setRange(50, 400)
+        self._zoom_slider.setSingleStep(25)
+        self._zoom_slider.setPageStep(50)
+        self._zoom_slider.setFixedWidth(150)
+        self._zoom_slider.setValue(100)
+        self._zoom_slider.setToolTip("Zoom")
+        self._zoom_slider.valueChanged.connect(self._on_zoom_slider_changed)
+
+        self._btn_zoom_in = QToolButton()
+        self._btn_zoom_in.setObjectName("zoomButton")
+        self._btn_zoom_in.setText("+")
+        self._btn_zoom_in.setToolTip("Zoom in")
+        self._btn_zoom_in.clicked.connect(lambda: self._canvas.step_zoom(1))
+
+        self._lbl_zoom = QLabel("100%")
+        self._lbl_zoom.setObjectName("zoomlabel")
+        self._lbl_zoom.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+        layout.addWidget(self._btn_zoom_out)
+        layout.addWidget(self._zoom_slider)
+        layout.addWidget(self._btn_zoom_in)
+        layout.addWidget(self._lbl_zoom)
+        return wrap
 
     # ── Shortcuts ─────────────────────────────────────────────────────────────
     def _connect_shortcuts(self):
@@ -855,6 +1100,18 @@ class PhotoEditorWindow(QMainWindow):
                 self._lbl_crop_info.setText(f"Crop: {cr.width()} × {cr.height()} px")
         else:
             self._lbl_crop_info.setText("")
+
+    def _on_zoom_slider_changed(self, value: int):
+        self._lbl_zoom.setText(f"{value}%")
+        self._canvas.set_zoom_percent(value)
+
+    def _on_canvas_zoom_changed(self, value: int):
+        if hasattr(self, '_zoom_slider'):
+            self._zoom_slider.blockSignals(True)
+            self._zoom_slider.setValue(value)
+            self._zoom_slider.blockSignals(False)
+        if hasattr(self, '_lbl_zoom'):
+            self._lbl_zoom.setText(f"{value}%")
 
     def _save_current(self):
         if not self._images:
